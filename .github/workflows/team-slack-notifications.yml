@@ -1,0 +1,340 @@
+# Usage (in caller repo):
+#
+# name: Team Slack Notifications
+#
+# on:
+#   pull_request:
+#     types: [closed, reopened, review_requested, review_request_removed]
+#     branches: [main]
+#   pull_request_review:
+#     types: [dismissed, submitted]
+#
+# jobs:
+#   read-teams:
+#     runs-on: ubuntu-24.04
+#     outputs:
+#       teams_json: ${{ steps.read.outputs.teams_json }}
+#     steps:
+#       - uses: actions/checkout@v4
+#         with:
+#           ref: ${{ github.event.pull_request.base.sha }}
+#       - id: read
+#         run: |
+#           # Example file: .github/team-slack-teams.json
+#           # Contents: [{"slug":"github-team-slug","channel_id":"C0ABXXXXXXX"}]
+#           echo "teams_json=$(jq -c . .github/team-slack-teams.json)" >> "$GITHUB_OUTPUT"
+#
+#   team-slack-notifications:
+#     needs: read-teams
+#     uses: joinhandshake/hs-org-gh-actions/.github/workflows/team-slack-notifications.yml@main
+#     with:
+#       teams_json: ${{ needs.read-teams.outputs.teams_json }}
+#       artifact_retention_days: 7
+#     secrets: inherit
+#
+# Notes:
+# - Each caller repo must define the `on:` triggers (this workflow is reusable-only via `workflow_call`).
+# - The caller repo must provide the required secrets.
+# - If the secrets exist on the org-level, the caller only needs to pass in secrets: inherit
+name: Team Slack Notifications
+
+on:
+  workflow_call:
+    inputs:
+      teams_json:
+        description: 'JSON array of {"slug":"<team-slug>","channel_id":"<slack-channel-id>"} objects'
+        required: true
+        type: string
+      artifact_retention_days:
+        description: "Retention days for Slack message timestamp artifacts"
+        required: false
+        type: number
+        default: 7
+    secrets:
+      SLACK_REVIEW_REQUESTED_BOT_TOKEN:
+        required: true
+      SLACK_REVIEW_REQUESTED_READ_TEAMS_TOKEN:
+        required: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  define-matrix:
+    name: Define Matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      teams: ${{ steps.set-teams.outputs.teams }}
+    steps:
+      - id: set-teams
+        run: |
+          if [ -z "$TEAMS_JSON" ]; then
+            echo "Input 'teams_json' is required." >&2
+            exit 1
+          fi
+
+          # Ensure teams_json is valid and safe to use:
+          # - array of objects
+          # - slug is a GitHub team slug (lowercase + digits + hyphens)
+          # - channel_id is a Slack channel ID (ex: C0123ABCDEF)
+          echo "$TEAMS_JSON" | jq -e '
+            type == "array" and
+            all(
+              .[];
+              type == "object" and
+              (.slug | type == "string") and
+              (.channel_id | type == "string") and
+              (.slug | test("^[a-z0-9]+(?:-[a-z0-9]+)*$")) and
+              (.channel_id | test("^C[A-Z0-9]+$"))
+            )
+          ' > /dev/null
+
+          echo "teams=$(echo "$TEAMS_JSON" | jq -c .)" >> "$GITHUB_OUTPUT"
+        env:
+          TEAMS_JSON: ${{ inputs.teams_json }}
+
+  slack-notification:
+    name: Slack Notification for Team Requested PR Review
+    if: ${{ github.event.action == 'review_requested' }}
+    needs: define-matrix
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    strategy:
+      matrix:
+        team: ${{ fromJson(needs.define-matrix.outputs.teams) }}
+    steps:
+      - name: Format message values
+        id: format-values
+        run: |
+          CHANGED_FILES=${{ github.event.pull_request.changed_files }}
+          if [ "$CHANGED_FILES" -eq 1 ]; then
+            FILE_LABEL="file"
+          else
+            FILE_LABEL="files"
+          fi
+          echo "file_label=$FILE_LABEL" >> $GITHUB_OUTPUT
+          # Slack uses &, <, and > as control characters so these characters need to be replaced with their HTML entities
+          ESCAPED_TITLE=$(echo "$PR_TITLE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+          echo "escaped_title=$ESCAPED_TITLE" >> $GITHUB_OUTPUT
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+
+      - name: Send ${{ matrix.team.slug }} Review Requested Slack Notification
+        id: send-slack-notification
+        if: ${{ github.event.requested_team.slug == matrix.team.slug }}
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v1 aikido: 3rd party Github Actions should be pinned
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_REVIEW_REQUESTED_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "${{ matrix.team.channel_id }}",
+              "text": ${{ toJson(format('<{0}|{1}> by {2}', github.event.pull_request.html_url, steps.format-values.outputs.escaped_title, github.event.pull_request.user.login)) }},
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ${{ toJson(format('<{0}|{1}>', github.event.pull_request.html_url, steps.format-values.outputs.escaped_title)) }}
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": ${{ toJson(format('Author: <https://github.com/{0}|{0}> | Repo: <https://github.com/{1}|{1}> | PR: <{2}|#{3}> | +{4} / -{5} in {6} {7}', github.event.pull_request.user.login, github.repository, github.event.pull_request.html_url, github.event.pull_request.number, github.event.pull_request.additions, github.event.pull_request.deletions, github.event.pull_request.changed_files, steps.format-values.outputs.file_label)) }}
+                    }
+                  ]
+                }
+              ]
+            }
+
+      - name: Save message timestamp to artifact
+        if: ${{ steps.send-slack-notification.outputs.ts != '' }}
+        run: |
+          echo '{"channel_id":"${{ matrix.team.channel_id }}","timestamp":"${{ steps.send-slack-notification.outputs.ts }}"}' > slack-msg.json
+
+      - name: Upload timestamp artifact
+        if: ${{ steps.send-slack-notification.outputs.ts != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: slack-msg-${{ github.event.pull_request.number }}-${{ matrix.team.slug }}
+          path: slack-msg.json
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+  slack-remove-notification:
+    name: Slack Notification for Review Request Removed
+    if: ${{ github.event.action == 'review_request_removed' }}
+    needs: define-matrix
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    strategy:
+      matrix:
+        team: ${{ fromJson(needs.define-matrix.outputs.teams) }}
+    steps:
+      - name: Download and read artifact
+        id: read-data
+        run: |
+          set +e  # Don't exit on error
+
+          ARTIFACT_NAME="slack-msg-${PR_NUMBER}-${TEAM_SLUG}"
+          ARTIFACT_ID=$(gh api "/repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=1" \
+            --jq '.artifacts[0].id // empty' 2>/dev/null)
+
+          # Download, extract, and read - all must succeed
+          if [ -n "$ARTIFACT_ID" ] && \
+             gh api "/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" > artifact.zip 2>/dev/null && \
+             unzip -q artifact.zip 2>/dev/null && \
+             [ -f slack-msg.json ]; then
+            echo "timestamp=$(jq -r '.timestamp' slack-msg.json)" >> $GITHUB_OUTPUT
+            echo "channel=$(jq -r '.channel_id' slack-msg.json)" >> $GITHUB_OUTPUT
+            echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TEAM_SLUG: ${{ matrix.team.slug }}
+      - name: Remove ${{ matrix.team.slug }} Review Request Slack Notification
+        id: remove-slack-notification
+        if: ${{ github.event.requested_team.slug == matrix.team.slug && steps.read-data.outputs.found == 'true' }}
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v1 aikido: 3rd party Github Actions should be pinned
+        with:
+          method: chat.delete
+          token: ${{ secrets.SLACK_REVIEW_REQUESTED_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "${{ steps.read-data.outputs.channel }}",
+              "ts": "${{ steps.read-data.outputs.timestamp }}"
+            }
+
+  slack-emoji-add-reaction:
+    name: Slack Emoji Add Reaction for Review
+    if: ${{ ((github.event.action == 'submitted' || github.event.action == 'dismissed') && github.event.review.user.type != 'Bot') || github.event.action == 'closed' || github.event.action == 'reopened' }}
+    needs: define-matrix
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    strategy:
+      matrix:
+        team: ${{ fromJson(needs.define-matrix.outputs.teams) }}
+    steps:
+      - name: Check if reviewer is from ${{ matrix.team.slug }} team via GitHub CLI
+        id: check-team-member
+        # These events don't have an associated reviewer
+        if: ${{ github.event.action != 'closed' && github.event.action != 'reopened' }}
+        run: |
+          REVIEWER="${{ github.event.review.user.login }}"
+          AUTHOR="${{ github.event.pull_request.user.login }}"
+          ORG="${{ github.repository_owner }}"
+          TEAM="$TEAM_SLUG"
+
+          # Check if the reviewer is the author of the pull request
+          if [ "$AUTHOR" = "$REVIEWER" ]; then
+            echo "is_author=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_author=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Checking if $REVIEWER is in ${ORG}/${TEAM}"
+          # List team members using GitHub CLI
+          if gh api "/orgs/${ORG}/teams/${TEAM}/members?per_page=100" --jq '.[].login' | grep -q "^${REVIEWER}$"; then
+            echo "is_member=true" >> $GITHUB_OUTPUT
+            echo "✅ $REVIEWER is a member of ${ORG}/${TEAM}"
+          else
+            echo "is_member=false" >> $GITHUB_OUTPUT
+            echo "⏭️  $REVIEWER is not a member of ${ORG}/${TEAM}"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.SLACK_REVIEW_REQUESTED_READ_TEAMS_TOKEN }}
+          TEAM_SLUG: ${{ matrix.team.slug }}
+
+      - name: Determine reaction emoji to add
+        id: determine-reaction-emoji-to-add
+        if: ${{ (steps.check-team-member.outputs.is_member == 'true' && github.event.action == 'submitted') || github.event.action == 'closed' }}
+        run: |
+          if [ "${{ github.event.review.state }}" = "approved" ]; then
+            echo "emoji=white_check_mark" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.review.state }}" = "changes_requested" ]; then
+            echo "emoji=x" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.action }}" = "closed" ] && [ "${{ github.event.pull_request.merged }}" = "true" ]; then
+            echo "emoji=pr-merged" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.action }}" = "closed" ] && [ "${{ github.event.pull_request.merged }}" = "false" ]; then
+            echo "emoji=pr-closed" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.check-team-member.outputs.is_author }}" = "false" ]; then
+            echo "emoji=eyes" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine reaction emoji to remove
+        id: determine-reaction-emoji-to-remove
+        if: ${{ steps.check-team-member.outputs.is_member == 'true' || github.event.action == 'reopened' }}
+        run: |
+          if [ "${{ github.event.action }}" = "dismissed" ]; then
+            if [ "${{ github.event.review.state }}" = "approved" ]; then
+              echo "emoji=white_check_mark" >> $GITHUB_OUTPUT
+            elif [ "${{ github.event.review.state }}" = "changes_requested" ]; then
+              echo "emoji=x" >> $GITHUB_OUTPUT
+            fi
+          elif [ "${{ github.event.action }}" = "submitted" ] && [ "${{ github.event.review.state }}" = "approved" ]; then
+            echo "emoji=x" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.action }}" = "submitted" ] && [ "${{ github.event.review.state }}" = "changes_requested" ]; then
+            echo "emoji=white_check_mark" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.action }}" = "reopened" ]; then
+            echo "emoji=pr-closed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download and read artifact
+        id: read-data
+        if: ${{ steps.check-team-member.outputs.is_member == 'true' || github.event.action == 'closed' || github.event.action == 'reopened' }}
+        run: |
+          set +e  # Don't exit on error
+
+          ARTIFACT_NAME="slack-msg-${PR_NUMBER}-${TEAM_SLUG}"
+          ARTIFACT_ID=$(gh api "/repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=1" \
+            --jq '.artifacts[0].id // empty' 2>/dev/null)
+
+          # Download, extract, and read - all must succeed
+          if [ -n "$ARTIFACT_ID" ] && \
+             gh api "/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" > artifact.zip 2>/dev/null && \
+             unzip -q artifact.zip 2>/dev/null && \
+             [ -f slack-msg.json ]; then
+            echo "timestamp=$(jq -r '.timestamp' slack-msg.json)" >> $GITHUB_OUTPUT
+            echo "channel=$(jq -r '.channel_id' slack-msg.json)" >> $GITHUB_OUTPUT
+            echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TEAM_SLUG: ${{ matrix.team.slug }}
+
+      - name: Add emoji reaction to ${{ matrix.team.slug }} Slack message
+        if: ${{ steps.read-data.outputs.found == 'true' && steps.determine-reaction-emoji-to-add.outputs.emoji != '' && (github.event.action == 'submitted' || github.event.action == 'closed') }}
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v1 aikido: 3rd party Github Actions should be pinned
+        with:
+          method: reactions.add
+          token: ${{ secrets.SLACK_REVIEW_REQUESTED_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "${{ steps.read-data.outputs.channel }}",
+              "timestamp": "${{ steps.read-data.outputs.timestamp }}",
+              "name": "${{ steps.determine-reaction-emoji-to-add.outputs.emoji }}"
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_REVIEW_REQUESTED_BOT_TOKEN }}
+
+      - name: Remove emoji reaction from ${{ matrix.team.slug }} Slack message
+        if: ${{ steps.read-data.outputs.found == 'true' && steps.determine-reaction-emoji-to-remove.outputs.emoji != '' }}
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v1 aikido: 3rd party Github Actions should be pinned
+        with:
+          method: reactions.remove
+          token: ${{ secrets.SLACK_REVIEW_REQUESTED_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "${{ steps.read-data.outputs.channel }}",
+              "timestamp": "${{ steps.read-data.outputs.timestamp }}",
+              "name": "${{ steps.determine-reaction-emoji-to-remove.outputs.emoji }}"
+            }

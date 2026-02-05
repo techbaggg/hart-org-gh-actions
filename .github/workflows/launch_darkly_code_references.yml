@@ -1,0 +1,45 @@
+name: LaunchDarkly Code References
+
+on: 
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+  workflow_call:
+
+# cancel in-flight workflow run if another push was triggered
+concurrency:
+  group: ${{ github.repository_id }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  launchDarklyCodeReferences:
+    name: LaunchDarkly Code References
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 11 # This value must be set if the lookback configuration option is not disabled for find-code-references. Read more: https://github.com/launchdarkly/ld-find-code-refs#searching-for-unused-flags-extinctions
+      - name: LaunchDarkly Code References
+        id: launchDarklyAction
+        uses: launchdarkly/find-code-references@v2.12.0
+        continue-on-error: true
+        with:
+          accessToken: ${{ secrets.LAUNCH_DARKLY_ACCESS_TOKEN }}
+          projKey: ${{ vars.LD_PROJ_KEY || 'default' }}
+          repoName: ${{ github.event.repository.name }}
+          contextLines: 0
+          ignoreServiceErrors: true
+    
+      - name: Send Error to Slack
+        id: slack
+        if: steps.launchDarklyAction.outcome == 'failure'
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload-delimiter: "_"
+          payload: |
+            {
+              "run_link": "https://github.com/joinhandshake/${{ github.event.repository.name }}/actions/runs/${{ github.run_id }}", 
+              "repo_name": "${{ github.event.repository.name }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.LAUNCH_DARKLY_SLACK_WEBHOOK_URL }}

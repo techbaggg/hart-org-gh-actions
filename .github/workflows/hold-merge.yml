@@ -1,0 +1,20 @@
+name: Check for Blocks
+on:
+  label:
+    types: [created, deleted]
+  pull_request:
+    types: [opened, labeled, reopened, synchronize, unlabeled]
+
+jobs:
+  check-merge:
+    runs-on: ubuntu-24.04
+    name: Hold Merge Label?
+    steps:
+      - run: |
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'hold merge') }}" == "true" ]]; then
+            echo "Cannot merge, 'hold merge' label is on this PR."
+            exit 1
+          fi
+
+          echo "No policies are blocking this PR"
+          exit 0

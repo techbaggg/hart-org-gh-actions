@@ -1,2 +1,3 @@
-# hart-org-gh-actions
-Common GitHub Actions for supporting our workflows
+# Handshake Organization Github Actions
+
+This is where common GitHub actions will live and they can be enforced at the organization level.
